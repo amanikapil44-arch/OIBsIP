@@ -1,0 +1,589 @@
+"""
+BMI Calculator - Oasis Infobyte Internship (Python Programming Domain)
+========================================================================
+
+A complete, production-ready BMI (Body Mass Index) Calculator desktop
+application built with Tkinter, backed by an SQLite database for
+persistent history, and matplotlib for trend visualization.
+
+Author : Amani Kapil
+Project: OIBsIP - Python Programming - Task 2 - BMI Calculator
+
+Features:
+    - Modern themed GUI (ttk) with a blue/white professional palette
+    - Input validation with clear, user-friendly error messages
+    - Automatic SQLite persistence of every calculation
+    - Color-coded BMI category results with a visual BMI scale
+    - Scrollable history table (Treeview) of all past records
+    - Matplotlib line-chart of BMI trend over time in a separate window
+    - Status bar, keyboard shortcut (Enter), and Clear All / Clear History
+
+Run with:
+    python bmi_calculator_gui.py
+"""
+
+import os
+import sqlite3
+import tkinter as tk
+from datetime import datetime
+from tkinter import ttk, messagebox
+
+import matplotlib
+matplotlib.use("TkAgg")  # Ensure matplotlib renders inside Tkinter windows
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+
+
+# --------------------------------------------------------------------------- #
+#  Configuration / Constants
+# --------------------------------------------------------------------------- #
+
+DB_FILENAME = "bmi_records.db"  # Created automatically alongside this script
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), DB_FILENAME)
+
+# Color palette (professional blue & white theme)
+COLOR_PRIMARY = "#1565C0"       # Deep blue - headers / buttons
+COLOR_PRIMARY_DARK = "#0D47A1"  # Darker blue - hover / accents
+COLOR_BG = "#F4F8FC"            # Very light blue-white - window background
+COLOR_CARD_BG = "#FFFFFF"       # White - card/section backgrounds
+COLOR_TEXT = "#1A1A1A"          # Near-black text
+COLOR_MUTED = "#5C6B7A"         # Muted gray-blue text
+
+# BMI category colors
+CATEGORY_COLORS = {
+    "Underweight": "#FFA000",   # Amber / Orange-Yellow
+    "Normal": "#2E7D32",        # Green
+    "Overweight": "#EF6C00",    # Orange
+    "Obese": "#C62828",         # Red
+}
+
+# BMI scale boundaries used both for classification and the visual gauge
+BMI_SCALE_MIN = 10.0
+BMI_SCALE_MAX = 40.0
+BMI_BANDS = [
+    ("Underweight", BMI_SCALE_MIN, 18.5, CATEGORY_COLORS["Underweight"]),
+    ("Normal", 18.5, 25.0, CATEGORY_COLORS["Normal"]),
+    ("Overweight", 25.0, 30.0, CATEGORY_COLORS["Overweight"]),
+    ("Obese", 30.0, BMI_SCALE_MAX, CATEGORY_COLORS["Obese"]),
+]
+
+
+# --------------------------------------------------------------------------- #
+#  Database Layer
+# --------------------------------------------------------------------------- #
+
+class BMIDatabase:
+    """Handles all SQLite database operations for BMI records."""
+
+    def __init__(self, db_path=DB_PATH):
+        """Connect to (or create) the SQLite database and ensure the schema exists."""
+        self.db_path = db_path
+        self.connection = sqlite3.connect(self.db_path)
+        self.connection.execute("PRAGMA foreign_keys = ON;")
+        self._create_table()
+
+    def _create_table(self):
+        """Create the `records` table if it does not already exist."""
+        query = """
+            CREATE TABLE IF NOT EXISTS records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                name TEXT NOT NULL,
+                weight REAL NOT NULL,
+                height REAL NOT NULL,
+                bmi REAL NOT NULL,
+                category TEXT NOT NULL
+            );
+        """
+        with self.connection:
+            self.connection.execute(query)
+
+    def insert_record(self, name, weight, height, bmi, category):
+        """Insert a new BMI record with the current timestamp."""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        query = """
+            INSERT INTO records (timestamp, name, weight, height, bmi, category)
+            VALUES (?, ?, ?, ?, ?, ?);
+        """
+        with self.connection:
+            self.connection.execute(query, (timestamp, name, weight, height, bmi, category))
+        return timestamp
+
+    def fetch_all_records(self):
+        """Return all records ordered by most recent first."""
+        query = "SELECT timestamp, name, weight, height, bmi, category FROM records ORDER BY id DESC;"
+        cursor = self.connection.execute(query)
+        return cursor.fetchall()
+
+    def fetch_records_chronological(self):
+        """Return all records ordered oldest-to-newest (for graphing trends)."""
+        query = "SELECT timestamp, name, weight, height, bmi, category FROM records ORDER BY id ASC;"
+        cursor = self.connection.execute(query)
+        return cursor.fetchall()
+
+    def clear_all_records(self):
+        """Delete every record from the database."""
+        with self.connection:
+            self.connection.execute("DELETE FROM records;")
+
+    def close(self):
+        """Close the database connection cleanly."""
+        self.connection.close()
+
+
+# --------------------------------------------------------------------------- #
+#  BMI Calculation Helpers
+# --------------------------------------------------------------------------- #
+
+def compute_bmi(weight_kg, height_m):
+    """
+    Compute BMI given weight in kilograms and height in meters.
+
+    Formula: BMI = weight (kg) / height (m)^2
+
+    Returns the BMI rounded to 2 decimal places.
+    """
+    bmi = weight_kg / (height_m ** 2)
+    return round(bmi, 2)
+
+
+def classify_bmi(bmi):
+    """Return the BMI category label (Underweight/Normal/Overweight/Obese)."""
+    if bmi < 18.5:
+        return "Underweight"
+    elif bmi < 25.0:
+        return "Normal"
+    elif bmi < 30.0:
+        return "Overweight"
+    else:
+        return "Obese"
+
+
+# --------------------------------------------------------------------------- #
+#  Main Application Class
+# --------------------------------------------------------------------------- #
+
+class BMICalculatorApp:
+    """Main Tkinter application class encapsulating the entire GUI and its logic."""
+
+    def __init__(self, root):
+        """Initialize the application window, styles, database, and widgets."""
+        self.root = root
+        self.db = BMIDatabase()
+
+        self._configure_root()
+        self._configure_styles()
+        self._build_layout()
+        self._load_history()
+
+        # Keyboard shortcut: Enter key triggers calculation
+        self.root.bind("<Return>", lambda event: self.calculate_bmi())
+
+        # Ensure the database connection closes gracefully on exit
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    # ----------------------------------------------------------------- #
+    #  Setup / Configuration
+    # ----------------------------------------------------------------- #
+
+    def _configure_root(self):
+        """Set window title, size, background color, and resizability."""
+        self.root.title("BMI Calculator - Oasis Infobyte")
+        self.root.geometry("980x760")
+        self.root.minsize(860, 680)
+        self.root.configure(bg=COLOR_BG)
+        self.root.resizable(True, True)
+
+    def _configure_styles(self):
+        """Configure ttk.Style() for a consistent, modern blue/white theme."""
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        style.configure("TFrame", background=COLOR_BG)
+        style.configure("Card.TFrame", background=COLOR_CARD_BG)
+
+        style.configure(
+            "TLabelframe", background=COLOR_CARD_BG, foreground=COLOR_PRIMARY_DARK,
+            font=("Segoe UI", 11, "bold"), borderwidth=1, relief="solid"
+        )
+        style.configure("TLabelframe.Label", background=COLOR_CARD_BG, foreground=COLOR_PRIMARY_DARK,
+                         font=("Segoe UI", 11, "bold"))
+
+        style.configure("TLabel", background=COLOR_CARD_BG, foreground=COLOR_TEXT, font=("Segoe UI", 10))
+        style.configure("Header.TLabel", background=COLOR_PRIMARY, foreground="white",
+                         font=("Segoe UI", 18, "bold"))
+        style.configure("SubHeader.TLabel", background=COLOR_PRIMARY, foreground="#E3F2FD",
+                         font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background=COLOR_PRIMARY_DARK, foreground="white",
+                         font=("Segoe UI", 9))
+        style.configure("Muted.TLabel", background=COLOR_CARD_BG, foreground=COLOR_MUTED, font=("Segoe UI", 9))
+        style.configure("ResultBMI.TLabel", background=COLOR_CARD_BG, font=("Segoe UI", 32, "bold"))
+        style.configure("ResultCategory.TLabel", background=COLOR_CARD_BG, font=("Segoe UI", 14, "bold"))
+
+        style.configure("TEntry", font=("Segoe UI", 10), padding=5)
+
+        style.configure("Primary.TButton", background=COLOR_PRIMARY, foreground="white",
+                         font=("Segoe UI", 10, "bold"), padding=8, borderwidth=0)
+        style.map("Primary.TButton", background=[("active", COLOR_PRIMARY_DARK)])
+
+        style.configure("Secondary.TButton", background="#90A4AE", foreground="white",
+                         font=("Segoe UI", 10), padding=6, borderwidth=0)
+        style.map("Secondary.TButton", background=[("active", "#607D8B")])
+
+        style.configure("Danger.TButton", background="#C62828", foreground="white",
+                         font=("Segoe UI", 10), padding=6, borderwidth=0)
+        style.map("Danger.TButton", background=[("active", "#8E1E1E")])
+
+        style.configure("Treeview", font=("Segoe UI", 9), rowheight=26, background="white",
+                         fieldbackground="white")
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"),
+                         background=COLOR_PRIMARY, foreground="white")
+        style.map("Treeview.Heading", background=[("active", COLOR_PRIMARY_DARK)])
+
+    # ----------------------------------------------------------------- #
+    #  Layout Construction
+    # ----------------------------------------------------------------- #
+
+    def _build_layout(self):
+        """Build and place all widgets/sections in the main window."""
+        self._build_header()
+
+        body = ttk.Frame(self.root, style="TFrame")
+        body.pack(fill="both", expand=True, padx=16, pady=12)
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(1, weight=1)
+
+        self._build_input_section(body)
+        self._build_results_section(body)
+        self._build_history_section(body)
+        self._build_status_bar()
+
+    def _build_header(self):
+        """Build the top header/title bar."""
+        header = tk.Frame(self.root, bg=COLOR_PRIMARY, height=70)
+        header.pack(fill="x", side="top")
+        header.pack_propagate(False)
+
+        ttk.Label(header, text="BMI Calculator", style="Header.TLabel").pack(
+            anchor="w", padx=20, pady=(10, 0))
+        ttk.Label(header, text="Oasis Infobyte | Python Programming Internship",
+                   style="SubHeader.TLabel").pack(anchor="w", padx=20)
+
+    def _build_input_section(self, parent):
+        """Build the input fields (Name, Weight, Height) and action buttons."""
+        frame = ttk.Labelframe(parent, text="Enter Details", padding=16)
+        frame.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=(0, 12))
+        frame.columnconfigure(1, weight=1)
+
+        ttk.Label(frame, text="Your Name").grid(row=0, column=0, sticky="w", pady=6)
+        self.name_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.name_var).grid(row=0, column=1, sticky="ew", pady=6, padx=(10, 0))
+
+        ttk.Label(frame, text="Enter Weight (kg)").grid(row=1, column=0, sticky="w", pady=6)
+        self.weight_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.weight_var).grid(row=1, column=1, sticky="ew", pady=6, padx=(10, 0))
+
+        ttk.Label(frame, text="Enter Height (m)").grid(row=2, column=0, sticky="w", pady=6)
+        self.height_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.height_var).grid(row=2, column=1, sticky="ew", pady=6, padx=(10, 0))
+
+        ttk.Label(frame, text="(e.g. weight 70.5 kg, height 1.75 m)", style="Muted.TLabel").grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        btn_row = ttk.Frame(frame, style="Card.TFrame")
+        btn_row.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        btn_row.columnconfigure(0, weight=1)
+        btn_row.columnconfigure(1, weight=1)
+
+        ttk.Button(btn_row, text="Calculate BMI", style="Primary.TButton",
+                   command=self.calculate_bmi).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ttk.Button(btn_row, text="Clear All", style="Secondary.TButton",
+                   command=self.clear_all).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    def _build_results_section(self, parent):
+        """Build the results display: BMI value, category, and visual gauge."""
+        frame = ttk.Labelframe(parent, text="Results", padding=16)
+        frame.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=(0, 12))
+        frame.columnconfigure(0, weight=1)
+
+        self.bmi_value_label = ttk.Label(frame, text="--", style="ResultBMI.TLabel", foreground=COLOR_MUTED)
+        self.bmi_value_label.grid(row=0, column=0, pady=(4, 0))
+
+        self.bmi_category_label = ttk.Label(frame, text="Enter details and calculate",
+                                             style="ResultCategory.TLabel", foreground=COLOR_MUTED)
+        self.bmi_category_label.grid(row=1, column=0, pady=(0, 12))
+
+        # Canvas-based visual BMI scale/gauge
+        self.scale_canvas = tk.Canvas(frame, height=60, bg=COLOR_CARD_BG, highlightthickness=0)
+        self.scale_canvas.grid(row=2, column=0, sticky="ew", pady=(4, 4))
+        self.scale_canvas.bind("<Configure>", lambda e: self._draw_bmi_scale())
+
+        legend = ttk.Frame(frame, style="Card.TFrame")
+        legend.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        for i, (label, _, _, color) in enumerate(BMI_BANDS):
+            dot = tk.Canvas(legend, width=10, height=10, bg=COLOR_CARD_BG, highlightthickness=0)
+            dot.create_oval(1, 1, 10, 10, fill=color, outline=color)
+            dot.grid(row=0, column=i * 2, padx=(0 if i == 0 else 10, 2))
+            ttk.Label(legend, text=label, style="Muted.TLabel").grid(row=0, column=i * 2 + 1)
+
+    def _build_history_section(self, parent):
+        """Build the scrollable history table and its action buttons."""
+        frame = ttk.Labelframe(parent, text="History", padding=12)
+        frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(0, 4))
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+
+        columns = ("date", "name", "weight", "height", "bmi", "category")
+        self.history_tree = ttk.Treeview(frame, columns=columns, show="headings", height=10)
+        headings = {
+            "date": "Date", "name": "Name", "weight": "Weight (kg)",
+            "height": "Height (m)", "bmi": "BMI", "category": "Category",
+        }
+        widths = {"date": 150, "name": 120, "weight": 100, "height": 100, "bmi": 80, "category": 110}
+        for col in columns:
+            self.history_tree.heading(col, text=headings[col])
+            self.history_tree.column(col, width=widths[col], anchor="center")
+
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.history_tree.yview)
+        self.history_tree.configure(yscrollcommand=vsb.set)
+
+        self.history_tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+
+        btn_row = ttk.Frame(frame, style="Card.TFrame")
+        btn_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        ttk.Button(btn_row, text="View Graph", style="Primary.TButton",
+                   command=self.view_graph).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="Clear History", style="Danger.TButton",
+                   command=self.clear_history).pack(side="left")
+
+    def _build_status_bar(self):
+        """Build the status bar shown at the bottom of the window."""
+        self.status_var = tk.StringVar(value="Ready. Enter your details and press Calculate BMI (or Enter).")
+        status_bar = ttk.Label(self.root, textvariable=self.status_var, style="Status.TLabel",
+                                anchor="w", padding=(10, 4))
+        status_bar.pack(fill="x", side="bottom")
+
+    # ----------------------------------------------------------------- #
+    #  Visual BMI Gauge
+    # ----------------------------------------------------------------- #
+
+    def _draw_bmi_scale(self, current_bmi=None):
+        """
+        Draw the horizontal color-banded BMI scale on the canvas, with an
+        optional marker indicating where the current BMI value falls.
+        """
+        canvas = self.scale_canvas
+        canvas.delete("all")
+        width = canvas.winfo_width()
+        height = canvas.winfo_height()
+        if width < 10 or height < 10:
+            return
+
+        bar_top = height * 0.35
+        bar_bottom = height * 0.75
+        span = BMI_SCALE_MAX - BMI_SCALE_MIN
+
+        def x_for(value):
+            value = max(BMI_SCALE_MIN, min(BMI_SCALE_MAX, value))
+            return ((value - BMI_SCALE_MIN) / span) * width
+
+        # Draw colored bands
+        for label, low, high, color in BMI_BANDS:
+            x0, x1 = x_for(low), x_for(high)
+            canvas.create_rectangle(x0, bar_top, x1, bar_bottom, fill=color, outline="")
+
+        # Draw marker for current BMI
+        if current_bmi is not None:
+            marker_x = x_for(current_bmi)
+            canvas.create_polygon(
+                marker_x - 7, bar_top - 12, marker_x + 7, bar_top - 12, marker_x, bar_top - 1,
+                fill=COLOR_PRIMARY_DARK, outline=""
+            )
+            canvas.create_line(marker_x, bar_top, marker_x, bar_bottom, fill="white", width=2)
+            canvas.create_text(marker_x, bar_bottom + 12, text=str(current_bmi),
+                                fill=COLOR_TEXT, font=("Segoe UI", 9, "bold"))
+
+    # ----------------------------------------------------------------- #
+    #  Core Logic: Calculate / Validate / Save
+    # ----------------------------------------------------------------- #
+
+    def calculate_bmi(self):
+        """
+        Validate inputs, compute the BMI, update the results display,
+        persist the record to the database, and refresh the history table.
+        """
+        name = self.name_var.get().strip()
+        weight_text = self.weight_var.get().strip()
+        height_text = self.height_var.get().strip()
+
+        # --- Validation: empty fields ---
+        if not name:
+            messagebox.showerror("Missing Name", "Please enter your name before calculating.")
+            return
+        if not weight_text or not height_text:
+            messagebox.showerror("Missing Input", "Please enter both weight and height.")
+            return
+
+        # --- Validation: numeric values ---
+        try:
+            weight = float(weight_text)
+        except ValueError:
+            messagebox.showerror("Invalid Weight", "Weight must be a numeric value (e.g. 70.5).")
+            return
+        try:
+            height = float(height_text)
+        except ValueError:
+            messagebox.showerror("Invalid Height", "Height must be a numeric value (e.g. 1.75).")
+            return
+
+        # --- Validation: positive values ---
+        if weight <= 0:
+            messagebox.showerror("Invalid Weight", "Weight must be greater than 0.")
+            return
+        if height <= 0:
+            messagebox.showerror("Invalid Height", "Height must be greater than 0.")
+            return
+
+        # --- Compute BMI ---
+        bmi = compute_bmi(weight, height)
+        category = classify_bmi(bmi)
+
+        # --- Update results display ---
+        self.bmi_value_label.config(text=f"{bmi:.2f}", foreground=CATEGORY_COLORS[category])
+        self.bmi_category_label.config(text=category, foreground=CATEGORY_COLORS[category])
+        self._draw_bmi_scale(current_bmi=bmi)
+
+        # --- Persist to database ---
+        try:
+            timestamp = self.db.insert_record(name, weight, height, bmi, category)
+        except sqlite3.Error as db_error:
+            messagebox.showerror("Database Error", f"Could not save record:\n{db_error}")
+            return
+
+        self._load_history()
+        self.status_var.set(f"Last calculated for '{name}' at {timestamp}  |  BMI: {bmi:.2f} ({category})")
+        messagebox.showinfo("Success", f"BMI calculated and saved successfully!\n\nBMI: {bmi:.2f}\nCategory: {category}")
+
+    def clear_all(self):
+        """Reset all input fields and the results display (does not affect saved history)."""
+        self.name_var.set("")
+        self.weight_var.set("")
+        self.height_var.set("")
+        self.bmi_value_label.config(text="--", foreground=COLOR_MUTED)
+        self.bmi_category_label.config(text="Enter details and calculate", foreground=COLOR_MUTED)
+        self._draw_bmi_scale()
+        self.status_var.set("Inputs cleared. Ready for a new calculation.")
+
+    # ----------------------------------------------------------------- #
+    #  History Table
+    # ----------------------------------------------------------------- #
+
+    def _load_history(self):
+        """Refresh the history Treeview with all records from the database."""
+        for row in self.history_tree.get_children():
+            self.history_tree.delete(row)
+
+        for timestamp, name, weight, height, bmi, category in self.db.fetch_all_records():
+            self.history_tree.insert(
+                "", "end",
+                values=(timestamp, name, f"{weight:.1f}", f"{height:.2f}", f"{bmi:.2f}", category),
+                tags=(category,)
+            )
+            self.history_tree.tag_configure(category, foreground=CATEGORY_COLORS.get(category, COLOR_TEXT))
+
+    def clear_history(self):
+        """Ask for confirmation, then delete all saved records from the database."""
+        if not self.db.fetch_all_records():
+            messagebox.showinfo("History Empty", "There is no history to clear.")
+            return
+
+        confirmed = messagebox.askyesno(
+            "Confirm Clear History",
+            "This will permanently delete ALL saved BMI records.\nAre you sure you want to continue?"
+        )
+        if confirmed:
+            self.db.clear_all_records()
+            self._load_history()
+            self.status_var.set("History cleared.")
+
+    # ----------------------------------------------------------------- #
+    #  Graph Window
+    # ----------------------------------------------------------------- #
+
+    def view_graph(self):
+        """Open a new window showing a line chart of BMI trend over time."""
+        records = self.db.fetch_records_chronological()
+        if not records:
+            messagebox.showinfo("No Data", "No records available yet. Calculate a BMI first.")
+            return
+
+        dates = [r[0].split(" ")[0] + "\n" + r[0].split(" ")[1] for r in records]
+        bmi_values = [r[4] for r in records]
+        categories = [r[5] for r in records]
+
+        graph_window = tk.Toplevel(self.root)
+        graph_window.title("BMI Trend Over Time - Oasis Infobyte")
+        graph_window.geometry("880x560")
+        graph_window.configure(bg=COLOR_BG)
+
+        figure = Figure(figsize=(8.5, 5), dpi=100)
+        ax = figure.add_subplot(111)
+
+        # Line connecting all points chronologically
+        ax.plot(range(len(bmi_values)), bmi_values, color=COLOR_PRIMARY, linewidth=1.8, zorder=1)
+
+        # Scatter points colored by category
+        point_colors = [CATEGORY_COLORS.get(cat, COLOR_TEXT) for cat in categories]
+        ax.scatter(range(len(bmi_values)), bmi_values, c=point_colors, s=55, zorder=2, edgecolors="white")
+
+        ax.set_title("BMI Trend Over Time", fontsize=14, fontweight="bold", color=COLOR_PRIMARY_DARK)
+        ax.set_xlabel("Date", fontsize=10)
+        ax.set_ylabel("BMI Value", fontsize=10)
+        ax.set_xticks(range(len(dates)))
+        ax.set_xticklabels(dates, rotation=45, ha="right", fontsize=7)
+        ax.grid(True, linestyle="--", alpha=0.5)
+
+        # Reference lines for BMI category boundaries
+        for _, low, _, _ in BMI_BANDS[1:]:
+            ax.axhline(y=low, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+
+        # Legend for category colors
+        handles = [
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color, markersize=8, label=label)
+            for label, _, _, color in BMI_BANDS
+        ]
+        ax.legend(handles=handles, loc="upper left", fontsize=8, framealpha=0.9)
+
+        figure.tight_layout()
+
+        canvas = FigureCanvasTkAgg(figure, master=graph_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+
+    # ----------------------------------------------------------------- #
+    #  Shutdown
+    # ----------------------------------------------------------------- #
+
+    def _on_close(self):
+        """Close the database connection and destroy the window cleanly."""
+        self.db.close()
+        self.root.destroy()
+
+
+# --------------------------------------------------------------------------- #
+#  Entry Point
+# --------------------------------------------------------------------------- #
+
+def main():
+    """Launch the BMI Calculator application."""
+    root = tk.Tk()
+    app = BMICalculatorApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
